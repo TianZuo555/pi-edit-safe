@@ -67,12 +67,31 @@ PI_EDIT_SAFE_DISABLE=1 pi
 ```sh
 npm install
 npm test         # node:test + tsx
+npm run bench     # A/B vs pi's real built-in edit (see below)
 npm run typecheck
 ```
 
-The suite encodes every known failure mode as a regression: ambiguity (the tui.go
-case), whole-file corruption (#3554), fuzzy drift, binary files, overlap, and the
-disproportionate guard.
+## A/B harness against the real built-in
+
+`npm run bench` runs the same `(file, edits)` pairs through **pi's actual shipped
+edit pipeline** (deep-imported from the installed `@earendil-works/pi-coding-agent`
+dist — `stripBom → detectLineEnding → normalizeToLF → applyEditsToNormalizedContent
+→ restoreLineEndings`, composed exactly as `dist/core/tools/edit.js` does) and through
+pi-edit-safe, then byte-diffs them and checks untouched "canary" lines.
+
+Current snapshot on pi 0.80.3 (8 cases): 7 agree, 1 diverge.
+
+- **Agree**: exact unique, ambiguity (both throw not-unique), the #3554 corruption
+  pattern (both preserve untouched bytes — **pi fixed it in 0.80.3**), binary refusal,
+  overlap, CRLF, multi-edit disjoint.
+- **Diverge**: when `oldText` collapses whitespace that the file has expanded
+  (e.g. `"x = a + b"` vs `"x =    a   +   b"`), pi's built-in throws "could not find
+  exact text"; pi-edit-safe applies it via whitespace-normalized fuzzy with full-span
+  + exactly-one guards. This is the "models get whitespace wrong" failure mode pi's
+  own article acknowledged — pi-edit-safe recovers it, the built-in doesn't.
+
+Divergences are the whole point: they show exactly what behavior changes before you
+trust it daily.
 
 ## Honesty
 
