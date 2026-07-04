@@ -32,14 +32,15 @@ test("fuzzy match edits only the touched line; everything else byte-identical", 
 	assert.equal(lines[4], 'const result = "done";');
 });
 
-test("fuzzy match (whitespace drift) still preserves untouched Unicode elsewhere", () => {
-	// Drift: oldText uses single space, file uses NBSP — forces whitespace strategy.
+test("fuzzy match (NBSP drift) still preserves untouched Unicode elsewhere", () => {
+	// Drift: oldText uses single space, file uses NBSP — the unicode strategy
+	// (tighter than whitespace-collapse) resolves it.
 	const edit = {
 		oldText: "// non breaking space here", // NBSP drifts → fuzzy
 		newText: "// edited line",
 	};
 	const { content, edits } = applyEdits(FILE, [edit], "test.ts");
-	assert.equal(edits[0].matchedVia, "whitespace");
+	assert.equal(edits[0].matchedVia, "unicode");
 	const lines = content.split("\n");
 	assert.equal(lines[3], "// edited line");
 	// Smart quotes / em-dash on line 1 untouched.

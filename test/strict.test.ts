@@ -31,6 +31,25 @@ test("ambiguous oldText that is not unique → throws (not silently edits first)
 	);
 });
 
+test("overlapping exact occurrences are counted as ambiguous → throws", () => {
+	// "aa" occurs at positions 0 AND 1 of "aaa"; picking either silently would
+	// be a wrong-place edit. Overlap-aware counting must see 2 occurrences.
+	assert.throws(
+		() => applyEdits("aaa\n", [{ oldText: "aa", newText: "XY" }], "overlap.txt"),
+		/not unique/i,
+	);
+});
+
+test("fuzzy no-op (file already matches newText) → throws instead of silent write", () => {
+	// oldText drifts (double space) so it fuzzy-matches the line, but newText
+	// equals what the file already contains → stale context, fail loudly.
+	const src = "alpha  beta\n";
+	assert.throws(
+		() => applyEdits(src, [{ oldText: "alpha beta", newText: "alpha  beta" }], "noop.txt"),
+		/no changes|already matches/i,
+	);
+});
+
 test("non-overlapping identical oldText given twice → throws", () => {
 	assert.throws(
 		() =>

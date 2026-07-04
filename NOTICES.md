@@ -8,6 +8,14 @@
   escape-normalized fuzzy strategies and the `isDisproportionateMatch` heuristic.
   Re-implemented from scratch; no code copied verbatim.
 
+## pi-coding-agent
+- Source: https://github.com/earendil-works/pi  (`core/tools/edit-diff.ts`)
+- License: MIT
+- Used for: the unicode punctuation normalization table (smart quotes, dash
+  variants, special spaces, NFKC) behind the `unicode` fuzzy strategy. Applied
+  span-only here (comparison never rewrites file bytes), unlike upstream's
+  whole-content normalize-and-restore pipeline.
+
 ## cline
 - Source: https://github.com/cline/cline  (evals/diff-edits/diff-apply)
 - License: MIT

@@ -124,6 +124,24 @@ const cases = [
 		],
 		canary: [2],
 	},
+	{
+		name: "09 unicode punctuation drift: ASCII oldText vs smart quotes/em-dash in file",
+		file: "Title \u201cQuoted\u201d \u2014 subtitle\nsecond line\nthird line\n",
+		edits: [{ oldText: 'Title "Quoted" - subtitle', newText: 'Title "Renamed" - subtitle' }],
+		canary: [2, 3],
+	},
+	{
+		name: "10 CRLF file + indent drift (fuzzy must keep \\r\\n intact)",
+		file: "function f() {\r\n    return 1;\r\n}\r\nconst keep = true;\r\n",
+		edits: [{ oldText: "function f() {\n  return 1;\n}", newText: "function f() {\n    return 2;\n}" }],
+		canary: [4],
+	},
+	{
+		name: "11 mixed line endings: exact edit must not flatten untouched terminators",
+		file: "a = 1;\r\nb = 2;\nc = 3;\r\n",
+		edits: [{ oldText: "a = 1;", newText: "a = 10;" }],
+		canary: [2, 3],
+	},
 ];
 
 // --- run + report ---

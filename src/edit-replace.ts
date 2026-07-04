@@ -2,8 +2,9 @@
 //
 // Algorithmic concepts (line-trimmed / whitespace-normalized / escape-normalized
 // fuzzy strategies, isDisproportionate heuristic) adapted from opencode's MIT
-// edit.ts, which traces to cline (MIT) and gemini-cli (Apache-2.0). Re-implemented
-// from scratch. See NOTICES.md.
+// edit.ts, which traces to cline (MIT) and gemini-cli (Apache-2.0). The unicode
+// punctuation mapping mirrors pi's own fuzzy normalizer (MIT), applied here
+// span-only. Re-implemented from scratch. See NOTICES.md.
 //
 // DESIGN PHILOSOPHY (reproduced independently from the maka-agent project, which
 // is unlicensed and was NOT used as a code source):
@@ -17,8 +18,12 @@
 //   4. No partial-signal strategies (no first/last-line anchoring, no similarity
 //      thresholds). Those are the documented cause of wrong-location edits in
 //      upstream projects.
+//   5. Line endings are handled at the span boundary, never whole-file: a fuzzy
+//      span never captures the trailing \r of a CRLF pair, newText is converted
+//      only when the file's endings are uniform, and untouched terminators are
+//      never rewritten (mixed files stay mixed).
 
-export type MatchStrategy = "exact" | "line-trimmed" | "whitespace" | "escape";
+export type MatchStrategy = "exact" | "line-trimmed" | "unicode" | "whitespace" | "escape";
 
 export interface EditRequest {
 	oldText: string;
@@ -53,7 +58,7 @@ type Span = { start: number; end: number; via: MatchStrategy };
  *
  * @throws when any oldText is missing, ambiguous (not unique), empty, identical
  *   to its newText, too short for a safe fuzzy match, on a binary/too-large file,
- *   or when two edits' spans overlap.
+ *   when two edits' spans overlap, or when the result is identical to the source.
  */
 export function applyEdits(source: string, edits: EditRequest[], where: string): ApplyResult {
 	if (!Array.isArray(edits) || edits.length === 0) {
@@ -104,12 +109,22 @@ export function applyEdits(source: string, edits: EditRequest[], where: string):
 	}
 	result += source.slice(cursor);
 
+	// A fuzzy span can equal newText even when oldText !== newText (drifted
+	// oldText, file already in the desired state). A silent no-op write would
+	// hide the model's stale context — fail loudly instead.
+	if (result === source) {
+		throw new Error(
+			`edit: no changes were produced in ${where} — the file already matches the requested result; re-read it before retrying`,
+		);
+	}
+
 	return { content: result, edits: outcomes };
 }
 
 /** Resolve a single oldText to a unique [start, end) span, exact then guarded fuzzy. */
 function resolveSpan(source: string, oldText: string, where: string): { start: number; end: number; via: MatchStrategy } {
-	// Exact match first — never gated.
+	// Exact match first — never gated. Occurrences are counted overlap-aware:
+	// "aa" in "aaa" is ambiguous (positions 0 and 1), not a unique match.
 	const exactCount = countOccurrences(source, oldText);
 	if (exactCount === 1) {
 		const idx = source.indexOf(oldText);
@@ -132,13 +147,17 @@ function resolveSpan(source: string, oldText: string, where: string): { start: n
 		throw new Error(`refusing a non-exact match in ${where}: file is too large to fuzzy-match safely; re-read and pass exact text`);
 	}
 
-	const strategies: Array<{ via: MatchStrategy; find: (c: string, f: string) => string[] }> = [
-		{ via: "line-trimmed", find: lineTrimmedSpans },
-		{ via: "whitespace", find: whitespaceNormalizedSpans },
-		{ via: "escape", find: escapeNormalizedSpans },
+	// Ordered by increasing tolerance. `effectiveFind` is what the strategy
+	// semantically matched against, used for the disproportion guard (the escape
+	// strategy legitimately expands a 1-line "a\nb\nc" oldText to 3 real lines).
+	const strategies: Array<{ via: MatchStrategy; find: (c: string, f: string) => string[]; effectiveFind: string }> = [
+		{ via: "line-trimmed", find: lineTrimmedSpans, effectiveFind: oldText },
+		{ via: "unicode", find: unicodePunctuationSpans, effectiveFind: oldText },
+		{ via: "whitespace", find: whitespaceNormalizedSpans, effectiveFind: oldText },
+		{ via: "escape", find: escapeNormalizedSpans, effectiveFind: unescapeText(oldText) },
 	];
 
-	for (const { via, find } of strategies) {
+	for (const { via, find, effectiveFind } of strategies) {
 		const candidates = dedupe(find(source, oldText).filter((c) => c.length > 0 && source.includes(c)));
 		if (candidates.length === 0) continue; // this strategy found nothing → try the next
 		if (candidates.length > 1) {
@@ -149,11 +168,16 @@ function resolveSpan(source: string, oldText: string, where: string): { start: n
 		if (source.indexOf(span) !== source.lastIndexOf(span)) {
 			throw new Error(`oldText matched a ${via} span that occurs more than once in ${where}; provide more context to disambiguate`);
 		}
-		if (isDisproportionate(span, oldText)) {
+		if (isDisproportionate(span, effectiveFind)) {
 			throw new Error(`refusing ${via} match in ${where}: the matched span is much larger than oldText; re-read and pass exact text`);
 		}
-		const idx = source.indexOf(span);
-		return { start: idx, end: idx + span.length, via };
+		const start = source.indexOf(span);
+		let end = start + span.length;
+		// Strategies split on \n, so in a CRLF file the last matched line carries
+		// its \r into the span. That \r belongs to the file's line terminator:
+		// leave it in place, or the splice would turn \r\n into a bare \n.
+		if (source[end - 1] === "\r" && source[end] === "\n") end -= 1;
+		return { start, end, via };
 	}
 
 	throw new Error(`oldText not found in ${where}; it must match the file's text including whitespace and indentation`);
@@ -161,8 +185,17 @@ function resolveSpan(source: string, oldText: string, where: string): { start: n
 
 // --- fuzzy strategies: each returns ORIGINAL substrings (never normalized) ---
 
-/** Match line-by-line after trimming each line. Handles indentation/trailing-ws drift. */
-function lineTrimmedSpans(content: string, find: string): string[] {
+/**
+ * Shared line-block walker: match `find` against consecutive whole lines of
+ * `content` using `sameLine`, returning the ORIGINAL substring for each match.
+ * If `find` ends with a newline, the span must include the file's newline after
+ * the last matched line (EOF without one is not a faithful match → skip).
+ */
+function lineBlockSpans(
+	content: string,
+	find: string,
+	sameLine: (fileLine: string, findLine: string) => boolean,
+): string[] {
 	const out: string[] = [];
 	const lines = content.split("\n");
 	const findEndsWithNewline = find.endsWith("\n");
@@ -173,7 +206,7 @@ function lineTrimmedSpans(content: string, find: string): string[] {
 	for (let i = 0; i <= lines.length - search.length; i++) {
 		let ok = true;
 		for (let j = 0; j < search.length; j++) {
-			if (lines[i + j].trim() !== search[j].trim()) {
+			if (!sameLine(lines[i + j], search[j])) {
 				ok = false;
 				break;
 			}
@@ -187,9 +220,6 @@ function lineTrimmedSpans(content: string, find: string): string[] {
 			end += lines[i + k].length;
 			if (k < search.length - 1) end += 1;
 		}
-		// If oldText ended with a newline, the span must include the file's newline
-		// after the last matched line, else the replacement would drop/duplicate it.
-		// EOF with no such newline is not a faithful match → skip.
 		if (findEndsWithNewline) {
 			const lastLine = i + search.length - 1;
 			if (lastLine >= lines.length - 1) continue;
@@ -200,55 +230,115 @@ function lineTrimmedSpans(content: string, find: string): string[] {
 	return out;
 }
 
+/** Match line-by-line after trimming each line. Handles indentation/trailing-ws drift. */
+function lineTrimmedSpans(content: string, find: string): string[] {
+	return lineBlockSpans(content, find, (a, b) => a.trim() === b.trim());
+}
+
+/**
+ * Unicode punctuation mapping (mirrors pi's fuzzy normalizer): smart quotes,
+ * unicode dashes, and special spaces collapse to their ASCII equivalents, plus
+ * NFKC. Used for COMPARISON only — matched spans keep their original bytes.
+ */
+function normalizeUnicodePunctuation(text: string): string {
+	return text
+		.normalize("NFKC")
+		// Smart single quotes → '
+		.replace(/[\u2018\u2019\u201A\u201B]/g, "'")
+		// Smart double quotes → "
+		.replace(/[\u201C\u201D\u201E\u201F]/g, '"')
+		// Hyphen/dash variants and minus → -
+		.replace(/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]/g, "-")
+		// NBSP and other special spaces → regular space
+		.replace(/[\u00A0\u2002-\u200A\u202F\u205F\u3000]/g, " ");
+}
+
+/** Match after mapping unicode punctuation to ASCII (per line, trimmed). The
+ * drift the model most often gets wrong in prose/markdown: “ ” vs ", — vs -, NBSP. */
+function unicodePunctuationSpans(content: string, find: string): string[] {
+	return lineBlockSpans(
+		content,
+		find,
+		(a, b) => normalizeUnicodePunctuation(a).trim() === normalizeUnicodePunctuation(b).trim(),
+	);
+}
+
 /** Match after collapsing all runs of whitespace to a single space. */
 function whitespaceNormalizedSpans(content: string, find: string): string[] {
 	const out: string[] = [];
 	const norm = (t: string) => t.replace(/\s+/g, " ").trim();
-	const want = norm(find);
+	const findEndsWithNewline = find.endsWith("\n");
+	const findLines = find.split("\n");
+	if (findEndsWithNewline) findLines.pop();
+	if (findLines.length === 0) return out;
+	const want = norm(findLines.join("\n"));
 	if (want === "") return out;
 	const lines = content.split("\n");
-	const findLines = find.split("\n");
+
+	// When oldText ends with a newline, the span must include the file's newline
+	// after the last matched line — and must NOT absorb a following
+	// whitespace-only line (norm() would treat its bytes as invisible).
+	const push = (i: number, count: number) => {
+		const block = lines.slice(i, i + count).join("\n");
+		if (findEndsWithNewline) {
+			if (i + count - 1 >= lines.length - 1) return; // EOF: no newline to include
+			out.push(block + "\n");
+		} else {
+			out.push(block);
+		}
+	};
 
 	if (findLines.length === 1) {
 		// Single-line oldText matches whole lines only. A multi-line oldText must
 		// never collapse onto one physical line (would be a wrong-location edit).
 		for (let i = 0; i < lines.length; i++) {
-			if (norm(lines[i]) === want) out.push(lines[i]);
+			if (norm(lines[i]) === want) push(i, 1);
 		}
 	} else {
 		for (let i = 0; i <= lines.length - findLines.length; i++) {
 			const block = lines.slice(i, i + findLines.length).join("\n");
-			if (norm(block) === want) out.push(block);
+			if (norm(block) === want) push(i, findLines.length);
 		}
 	}
 	return out;
 }
 
-/** Match after unescaping common escape sequences (\\n \\t \\\\ etc.). */
+/** Unescape common escape sequences (\n \t \\ etc.) written literally. */
+function unescapeText(str: string): string {
+	return str.replace(/\\(n|t|r|'|"|`|\\|\n|\$)/g, (m, ch: string) => {
+		switch (ch) {
+			case "n": return "\n";
+			case "t": return "\t";
+			case "r": return "\r";
+			case "'": return "'";
+			case '"': return '"';
+			case "`": return "`";
+			case "\\": return "\\";
+			case "\n": return "\n";
+			case "$": return "$";
+			default: return m;
+		}
+	});
+}
+
+/** Match after unescaping common escape sequences in oldText. */
 function escapeNormalizedSpans(content: string, find: string): string[] {
 	const out: string[] = [];
-	const unescape = (str: string) =>
-		str.replace(/\\(n|t|r|'|"|`|\\|\n|\$)/g, (m, ch: string) => {
-			switch (ch) {
-				case "n": return "\n";
-				case "t": return "\t";
-				case "r": return "\r";
-				case "'": return "'";
-				case '"': return '"';
-				case "`": return "`";
-				case "\\": return "\\";
-				case "\n": return "\n";
-				case "$": return "$";
-				default: return m;
-			}
-		});
-	const want = unescape(find);
+	const want = unescapeText(find);
 	if (content.includes(want)) out.push(want);
+	// CRLF variant of the direct match: the unescaped \n may correspond to \r\n
+	// in the file. The returned span keeps the file's original bytes.
+	if (want.includes("\n") && content.includes("\r\n")) {
+		const wantCRLF = want.replace(/\n/g, "\r\n");
+		if (wantCRLF !== want && content.includes(wantCRLF)) out.push(wantCRLF);
+	}
 	const lines = content.split("\n");
 	const findLines = want.split("\n");
 	for (let i = 0; i <= lines.length - findLines.length; i++) {
 		const block = lines.slice(i, i + findLines.length).join("\n");
-		if (unescape(block) === want) out.push(block);
+		// Compare with the block's CRLF pairs normalized (they are file line
+		// terminators, not content); the pushed span keeps the original bytes.
+		if (unescapeText(block.replace(/\r\n/g, "\n")) === want) out.push(block);
 	}
 	return out;
 }
@@ -256,9 +346,10 @@ function escapeNormalizedSpans(content: string, find: string): string[] {
 // --- helpers ---
 
 /** Defense-in-depth guard. The curated strategies above all match a span whose
- * line count equals oldText's, so this rarely fires today — it exists to reject any
- * future partial-signal strategy (first/last-line anchoring) that could balloon a
- * span, which is the documented cause of wrong-location edits upstream. */
+ * line count equals the effective find's, so this rarely fires today — it exists
+ * to reject any future partial-signal strategy (first/last-line anchoring) that
+ * could balloon a span, which is the documented cause of wrong-location edits
+ * upstream. */
 export function isDisproportionate(span: string, find: string): boolean {
 	const oldLines = find.split("\n").length;
 	const spanLines = span.split("\n").length;
@@ -267,13 +358,15 @@ export function isDisproportionate(span: string, find: string): boolean {
 	return span.trim().length > Math.max(find.trim().length + 500, find.trim().length * 4);
 }
 
+/** Overlap-aware occurrence count: advances one char at a time, so "aa" occurs
+ * twice in "aaa". Anything else would silently pick one of two valid positions. */
 function countOccurrences(haystack: string, needle: string): number {
 	if (needle === "") return 0;
 	let count = 0;
 	let idx = haystack.indexOf(needle);
 	while (idx !== -1) {
 		count++;
-		idx = haystack.indexOf(needle, idx + needle.length);
+		idx = haystack.indexOf(needle, idx + 1);
 	}
 	return count;
 }
@@ -291,15 +384,19 @@ function lineOf(source: string, index: number): number {
 }
 
 /**
- * If the source uses CRLF line endings, convert the replacement's LF to CRLF so
- * the edit does not flip the file's line-ending style. LF-only and mixed files
- * are left as-is (the replacement is written verbatim).
+ * Convert the replacement's line endings to the file's style, but only when the
+ * file is uniform: CRLF-only files get newText's LF → CRLF, LF-only files get
+ * newText's stray CRLF → LF. Mixed-ending files (and files with no newlines)
+ * take newText verbatim — guessing would rewrite bytes the model never asked for.
  */
 function toFileLineEndings(text: string, source: string): string {
 	const hasCRLF = source.includes("\r\n");
-	const hasBareLF = source.includes("\n") && !hasCRLF;
+	const hasBareLF = /(?<!\r)\n/.test(source);
 	if (hasCRLF && !hasBareLF) {
 		return text.replace(/\r?\n/g, "\r\n");
+	}
+	if (hasBareLF && !hasCRLF) {
+		return text.replace(/\r\n/g, "\n");
 	}
 	return text;
 }
