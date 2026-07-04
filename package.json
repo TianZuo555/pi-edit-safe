@@ -1,0 +1,29 @@
+{
+  "name": "pi-edit-safe",
+  "version": "0.1.0",
+  "description": "A stricter edit tool for the pi coding agent — maka-philosophy matching (full-span verification, throw-on-ambiguity) on pi's edits[] contract. Re-implemented from opencode (MIT).",
+  "license": "MIT",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "test": "node --test --import tsx \"test/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "pi",
+    "pi-coding-agent",
+    "edit-tool",
+    "coding-agent",
+    "extension"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.80.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.3",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typebox": "1.1.38",
+    "typescript": "^5.6.0"
+  }
+}
