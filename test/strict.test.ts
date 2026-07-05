@@ -50,7 +50,9 @@ test("fuzzy no-op (file already matches newText) → throws instead of silent wr
 	);
 });
 
-test("non-overlapping identical oldText given twice → throws", () => {
+test("same oldText twice (different newText): second fails with earlier-edit hint", () => {
+	// Sequential: edit 1 rewrites the line, so edit 2's oldText no longer exists.
+	// The error must say an earlier edit caused it, not just "not found".
 	assert.throws(
 		() =>
 			applyEdits(
@@ -61,12 +63,11 @@ test("non-overlapping identical oldText given twice → throws", () => {
 				],
 				"tui.go",
 			),
-		/overlap|unique/i,
+		/earlier edit/i,
 	);
 });
 
-test("two edits whose spans overlap → throws", () => {
-	// outer span fully contains inner span.
+test("edit targeting text consumed by an earlier edit → fails with earlier-edit hint", () => {
 	assert.throws(
 		() =>
 			applyEdits(
@@ -77,7 +78,65 @@ test("two edits whose spans overlap → throws", () => {
 				],
 				"f.js",
 			),
-		/overlap/i,
+		/earlier edit/i,
+	);
+});
+
+test("exact duplicate edit entries → throws duplicate (never applied twice)", () => {
+	assert.throws(
+		() =>
+			applyEdits(
+				FILE,
+				[
+					{ oldText: "func layoutA() {", newText: "func layoutA(ctx) {" },
+					{ oldText: "func layoutA() {", newText: "func layoutA(ctx) {" },
+				],
+				"tui.go",
+			),
+		/duplicate/i,
+	);
+});
+
+test("sequential chaining: a later edit may target an earlier edit's output", () => {
+	const src = "const value = 1;\nconst other = 9;\n";
+	const { content, edits } = applyEdits(
+		src,
+		[
+			{ oldText: "const value = 1;", newText: "const value = 2;" },
+			{ oldText: "const value = 2;", newText: "export const value = 2;" },
+		],
+		"chain.ts",
+	);
+	assert.equal(content, "export const value = 2;\nconst other = 9;\n");
+	assert.equal(edits.length, 2);
+});
+
+test("disjoint multi-edit behaves as if matched against the original file", () => {
+	const src = "import a from 'a';\nimport b from 'b';\nimport c from 'c';\n";
+	const { content } = applyEdits(
+		src,
+		[
+			{ oldText: "import c from 'c';", newText: "import c from 'z';" },
+			{ oldText: "import a from 'a';", newText: "import a from 'x';" },
+		],
+		"imports.ts",
+	);
+	assert.equal(content, "import a from 'x';\nimport b from 'b';\nimport c from 'z';\n");
+});
+
+test("earlier edit's newText creates extra matches for a later edit → ambiguity hint", () => {
+	const src = "start()\nmarker()\nend()\n";
+	assert.throws(
+		() =>
+			applyEdits(
+				src,
+				[
+					{ oldText: "start()", newText: "start()\nmarker()" },
+					{ oldText: "marker()", newText: "marker(1)" },
+				],
+				"seq.ts",
+			),
+		/introduced additional matches/i,
 	);
 });
 

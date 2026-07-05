@@ -1,10 +1,34 @@
 # pi-edit-safe
 
 A drop-in replacement for the **pi coding agent**'s built-in `edit` tool, with a
-stricter matcher that refuses to silently edit the wrong place.
+stricter matcher that refuses to silently edit the wrong place — and a call shape
+that weaker models can actually use.
 
-> Keeps pi's `edits[]` contract (multiple disjoint edits, each matched against the
-> original file) so the model needs **no retraining** — just swap the tool.
+> Accepts pi's `edits[]` shape **plus** the shapes models emit anyway (top-level
+> `oldText`/`newText`, Claude-Code/opencode field names, stringified arrays), so
+> no model needs retraining. Multi-edit applies **in order** (sequential) — the
+> contract models assume from multi-edit tools elsewhere — instead of pi's
+> all-against-the-original-file semantic.
+
+## Call shapes
+
+```jsonc
+// simplest — what weak models reach for first:
+{ "path": "src/a.ts", "oldText": "const x = 1;", "newText": "const x = 2;" }
+
+// several changes in one call, applied in order, top to bottom:
+{ "path": "src/a.ts", "edits": [
+	{ "oldText": "...", "newText": "..." },
+	{ "oldText": "...", "newText": "..." }
+] }
+```
+
+Also accepted and normalized before validation: `file_path`/`filePath` for `path`,
+`old_string`/`new_string` and `oldString`/`newString` for the pair (per entry or
+top-level), `edits` as a JSON **string**, and `edits` as a single object. Exact
+duplicate entries are rejected loudly (weak models emit them; under sequential
+application they could otherwise apply twice). When a later edit fails because an
+earlier edit in the same call rewrote its target, the error says exactly that.
 
 ## Why
 
@@ -30,6 +54,8 @@ This tool takes the opposite stance on every one of those decisions:
 | Untouched bytes | historically normalized | **never touched** (slice + verbatim splice) |
 | Line endings | n/a (single-string replace) | **span-boundary only**; mixed-ending files never flattened (pi's built-in whole-file restore does) |
 | new_string write | `String.replace` (`$&` bug) | **slice-join** (literal) |
+| Multi-edit semantics | n/a (single edit per call) | **sequential, in order** (pi built-in: all edits vs the original file) |
+| Input shapes | one strict schema | **lenient**: shorthand, alias keys, stringified arrays — normalized before validation |
 
 ## How it works
 
@@ -48,9 +74,12 @@ This tool takes the opposite stance on every one of those decisions:
    stray CRLF→LF in LF files); mixed-ending files take `newText` verbatim and
    untouched terminators are **never rewritten**. A fuzzy span never captures the
    trailing `\r` of a CRLF pair.
-6. All edit spans resolved against the **original** file; pairwise overlap → throw.
-   A result byte-identical to the original also throws (stale-context signal, not
-   a silent no-op write).
+6. Multi-edit calls apply **sequentially, in order** — each `oldText` is matched
+   against the file as already changed by the previous edits. Disjoint edits (the
+   common case) produce byte-identical results to matching against the original;
+   dependent edits work instead of erroring. Exact duplicates throw; a later edit
+   broken by an earlier one gets an error that says so. A result byte-identical
+   to the original also throws (stale-context signal, not a silent no-op write).
 
 Every failure is a thrown error the model can read, re-read the file, and retry —
 no silent recovery, no edits built on a stale lie.
@@ -88,7 +117,7 @@ dist — `stripBom → detectLineEnding → normalizeToLF → applyEditsToNormal
 → restoreLineEndings`, composed exactly as `dist/core/tools/edit.js` does) and through
 pi-edit-safe, then byte-diffs them and checks untouched "canary" lines.
 
-Current snapshot on pi 0.80.3 (11 cases): 8 agree, 3 diverge.
+Current snapshot on pi 0.80.3 (12 cases): 8 agree, 4 diverge.
 
 - **Agree**: exact unique, ambiguity (both throw not-unique), the #3554 corruption
   pattern (both preserve untouched bytes — **pi fixed it in 0.80.3**), binary refusal,
@@ -104,6 +133,9 @@ Current snapshot on pi 0.80.3 (11 cases): 8 agree, 3 diverge.
   ending, silently flattening line 2's bare `\n` to `\r\n` (canary CORRUPTED in the
   bench). pi-edit-safe splices at the span boundary and never rewrites untouched
   terminators.
+- **Diverge (sequential contract)**: dependent edits — edit 2's `oldText` targets
+  edit 1's output. The built-in matches every edit against the original file and
+  throws "not found"; pi-edit-safe applies them in order and both succeed.
 
 Divergences are the whole point: they show exactly what behavior changes before you
 trust it daily.

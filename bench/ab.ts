@@ -107,7 +107,8 @@ const cases = [
 			{ oldText: "function f() {\n  return 1;\n}", newText: "x" },
 			{ oldText: "return 1;", newText: "return 2;" },
 		],
-		// both should throw.
+		// both should throw: builtin as overlap (parallel), safe as an
+		// earlier-edit-consumed-this-text error (sequential).
 	},
 	{
 		name: "07 CRLF file, LF oldText",
@@ -141,6 +142,17 @@ const cases = [
 		file: "a = 1;\r\nb = 2;\nc = 3;\r\n",
 		edits: [{ oldText: "a = 1;", newText: "a = 10;" }],
 		canary: [2, 3],
+	},
+	{
+		name: "12 dependent edits: edit 2 targets edit 1's output (sequential contract)",
+		file: "const value = 1;\nconst other = 9;\n",
+		edits: [
+			{ oldText: "const value = 1;", newText: "const value = 2;" },
+			{ oldText: "const value = 2;", newText: "export const value = 2;" },
+		],
+		// builtin matches all edits against the ORIGINAL file → edit 2 not found;
+		// safe applies edits in order → both succeed.
+		canary: [2],
 	},
 ];
 

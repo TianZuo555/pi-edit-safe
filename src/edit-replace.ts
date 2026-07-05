@@ -22,6 +22,12 @@
 //      span never captures the trailing \r of a CRLF pair, newText is converted
 //      only when the file's endings are uniform, and untouched terminators are
 //      never rewritten (mixed files stay mixed).
+//   6. Multi-edit calls apply SEQUENTIALLY, in order — each oldText is matched
+//      against the result of the previous edits, the contract models assume
+//      from multi-edit tools elsewhere (pi's built-in instead matches all edits
+//      against the original file). Disjoint edits behave identically under both;
+//      dependent edits work here, duplicates are rejected loudly, and failures
+//      caused by an earlier edit in the same call say so.
 
 export type MatchStrategy = "exact" | "line-trimmed" | "unicode" | "whitespace" | "escape";
 
@@ -33,10 +39,36 @@ export interface EditRequest {
 export interface EditOutcome {
 	/** Which strategy located oldText. */
 	matchedVia: MatchStrategy;
-	/** 1-based first line of the matched span in the original source. */
+	/** 1-based first line of the matched span, in the content the edit was
+	 * applied to (the original file for edit 1; for later edits, the text as
+	 * already changed by the previous edits in the call). */
 	startLine: number;
-	/** 1-based last line (inclusive) of the matched span in the original source. */
+	/** 1-based last line (inclusive) of the matched span, same reference. */
 	endLine: number;
+}
+
+/** Every failure this module throws, tagged with a machine-readable code. */
+export class EditError extends Error {
+	constructor(
+		message: string,
+		readonly code:
+			| "no-edits"
+			| "invalid-edit"
+			| "duplicate-edit"
+			| "empty-old-text"
+			| "no-op-edit"
+			| "too-short"
+			| "binary"
+			| "too-large"
+			| "not-unique"
+			| "ambiguous"
+			| "disproportionate"
+			| "not-found"
+			| "no-changes",
+	) {
+		super(message);
+		this.name = "EditError";
+	}
 }
 
 export interface ApplyResult {
@@ -49,76 +81,107 @@ const MIN_FUZZY_OLD_TEXT_LENGTH = 5;
 const MAX_FUZZY_SOURCE_CHARS = 1_000_000;
 const MAX_FUZZY_SOURCE_LINES = 50_000;
 
-type Span = { start: number; end: number; via: MatchStrategy };
-
 /**
- * Apply one or more disjoint edits to `source`. Each edit's `oldText` is matched
- * against the ORIGINAL source (not incrementally), so edits do not see each
- * other's effects. All matched spans must be pairwise non-overlapping.
+ * Apply one or more edits to `source`, SEQUENTIALLY: each edit's `oldText` is
+ * matched against the content as already changed by the previous edits in the
+ * same call — the contract models assume from multi-edit tools elsewhere.
+ * Disjoint edits produce exactly the same bytes as matching everything against
+ * the original file; dependent edits (a later oldText targeting an earlier
+ * newText's output) work instead of erroring.
  *
  * @throws when any oldText is missing, ambiguous (not unique), empty, identical
- *   to its newText, too short for a safe fuzzy match, on a binary/too-large file,
- *   when two edits' spans overlap, or when the result is identical to the source.
+ *   to its newText, an exact duplicate of an earlier edit, too short for a safe
+ *   fuzzy match, on a binary/too-large file, or when the result is identical to
+ *   the source.
  */
 export function applyEdits(source: string, edits: EditRequest[], where: string): ApplyResult {
 	if (!Array.isArray(edits) || edits.length === 0) {
-		throw new Error(`edit: no edits provided for ${where}`);
+		throw new EditError(
+			`edit: no edits provided for ${where} — pass oldText/newText for a single replacement, or edits: [{oldText, newText}, ...] for several`,
+			"no-edits",
+		);
 	}
 
-	// Resolve every edit's span against the original source first.
-	const spans: Span[] = [];
+	// Validate shape and reject exact duplicates up front. Models sometimes emit
+	// the same edit twice; under sequential application a duplicate could even
+	// apply twice (when newText still contains oldText), so fail loudly instead.
+	const seen = new Set<string>();
+	for (let i = 0; i < edits.length; i++) {
+		const e = edits[i];
+		if (!e || typeof e.oldText !== "string" || typeof e.newText !== "string") {
+			throw new EditError(
+				`edit ${i + 1}: each edit needs string oldText and newText fields in ${where}`,
+				"invalid-edit",
+			);
+		}
+		const key = JSON.stringify([e.oldText, e.newText]);
+		if (seen.has(key)) {
+			throw new EditError(
+				`edit ${i + 1} is an exact duplicate of an earlier edit in ${where}; remove it (each replacement is applied once)`,
+				"duplicate-edit",
+			);
+		}
+		seen.add(key);
+	}
+
+	let content = source;
 	const outcomes: EditOutcome[] = new Array(edits.length);
 	for (let i = 0; i < edits.length; i++) {
 		const { oldText, newText } = edits[i];
+		const editWhere = edits.length === 1 ? where : `${where} (edit ${i + 1} of ${edits.length})`;
 		if (oldText === "") {
-			throw new Error(`edit ${i + 1}: oldText must not be empty in ${where}`);
+			throw new EditError(`edit ${i + 1}: oldText must not be empty in ${where}`, "empty-old-text");
 		}
 		if (oldText === newText) {
-			throw new Error(`edit ${i + 1}: no changes to apply in ${where} (oldText === newText)`);
+			throw new EditError(`edit ${i + 1}: no changes to apply in ${where} (oldText === newText)`, "no-op-edit");
 		}
-		const span = resolveSpan(source, oldText, `${where} (edit ${i + 1})`);
-		spans.push({ ...span, via: span.via });
+
+		let span: { start: number; end: number; via: MatchStrategy };
+		try {
+			span = resolveSpan(content, oldText, editWhere);
+		} catch (err) {
+			throw withSequentialHint(err, source, oldText, i);
+		}
+
 		outcomes[i] = {
 			matchedVia: span.via,
-			startLine: lineOf(source, span.start),
-			endLine: lineOf(source, span.end - 1),
+			startLine: lineOf(content, span.start),
+			endLine: lineOf(content, span.end - 1),
 		};
+		content = content.slice(0, span.start) + toFileLineEndings(newText, content) + content.slice(span.end);
 	}
-
-	// Reject overlapping edits (intervals are half-open [start, end)).
-	for (let a = 0; a < spans.length; a++) {
-		for (let b = a + 1; b < spans.length; b++) {
-			const A = spans[a];
-			const B = spans[b];
-			if (A.start < B.end && B.start < A.end) {
-				throw new Error(
-					`edit: edits ${a + 1} and ${b + 1} overlap in ${where}; provide disjoint oldText blocks`,
-				);
-			}
-		}
-	}
-
-	// Stitch: sort a copy by start position, slice the original, splice in newText.
-	const order = spans.map((s, i) => ({ s, i })).sort((x, y) => x.s.start - y.s.start);
-	let result = "";
-	let cursor = 0;
-	for (const { s, i } of order) {
-		result += source.slice(cursor, s.start);
-		result += toFileLineEndings(edits[i].newText, source);
-		cursor = s.end;
-	}
-	result += source.slice(cursor);
 
 	// A fuzzy span can equal newText even when oldText !== newText (drifted
 	// oldText, file already in the desired state). A silent no-op write would
 	// hide the model's stale context — fail loudly instead.
-	if (result === source) {
-		throw new Error(
+	if (content === source) {
+		throw new EditError(
 			`edit: no changes were produced in ${where} — the file already matches the requested result; re-read it before retrying`,
+			"no-changes",
 		);
 	}
 
-	return { content: result, edits: outcomes };
+	return { content, edits: outcomes };
+}
+
+/** When a later edit fails because an EARLIER edit in the same call rewrote its
+ * target (or introduced new matches), say so — a bare "not found" would send the
+ * model re-reading a file that never contained the problem. */
+function withSequentialHint(err: unknown, source: string, oldText: string, index: number): unknown {
+	if (index === 0 || !(err instanceof EditError)) return err;
+	if (err.code === "not-found" && countOccurrences(source, oldText) > 0) {
+		return new EditError(
+			`${err.message}; note: edits apply in order, and an earlier edit in this call already changed this text — write oldText against the updated content, or merge the edits into one`,
+			err.code,
+		);
+	}
+	if ((err.code === "not-unique" || err.code === "ambiguous") && countOccurrences(source, oldText) <= 1) {
+		return new EditError(
+			`${err.message}; note: edits apply in order, and an earlier edit's newText introduced additional matches — merge or reorder the edits`,
+			err.code,
+		);
+	}
+	return err;
 }
 
 /** Resolve a single oldText to a unique [start, end) span, exact then guarded fuzzy. */
@@ -131,20 +194,21 @@ function resolveSpan(source: string, oldText: string, where: string): { start: n
 		return { start: idx, end: idx + oldText.length, via: "exact" };
 	}
 	if (exactCount > 1) {
-		throw new Error(`oldText is not unique in ${where} (${exactCount} exact matches); provide more context`);
+		throw new EditError(`oldText is not unique in ${where} (${exactCount} exact matches); provide more context`, "not-unique");
 	}
 
 	// Exact failed → fuzzy. Apply hard gates up front.
 	if (oldText.trim().length < MIN_FUZZY_OLD_TEXT_LENGTH) {
-		throw new Error(
+		throw new EditError(
 			`oldText is too short for a non-exact match in ${where}; provide a longer, exact snippet`,
+			"too-short",
 		);
 	}
 	if (source.indexOf("\0") !== -1) {
-		throw new Error(`refusing a non-exact match in ${where}: file looks binary (contains a NUL byte); re-read and pass exact text`);
+		throw new EditError(`refusing a non-exact match in ${where}: file looks binary (contains a NUL byte); re-read and pass exact text`, "binary");
 	}
 	if (source.length > MAX_FUZZY_SOURCE_CHARS || countOccurrences(source, "\n") + 1 > MAX_FUZZY_SOURCE_LINES) {
-		throw new Error(`refusing a non-exact match in ${where}: file is too large to fuzzy-match safely; re-read and pass exact text`);
+		throw new EditError(`refusing a non-exact match in ${where}: file is too large to fuzzy-match safely; re-read and pass exact text`, "too-large");
 	}
 
 	// Ordered by increasing tolerance. `effectiveFind` is what the strategy
@@ -161,15 +225,15 @@ function resolveSpan(source: string, oldText: string, where: string): { start: n
 		const candidates = dedupe(find(source, oldText).filter((c) => c.length > 0 && source.includes(c)));
 		if (candidates.length === 0) continue; // this strategy found nothing → try the next
 		if (candidates.length > 1) {
-			throw new Error(`oldText matched ${candidates.length} different ${via} candidates in ${where}; provide more context to disambiguate`);
+			throw new EditError(`oldText matched ${candidates.length} different ${via} candidates in ${where}; provide more context to disambiguate`, "ambiguous");
 		}
 		const span = candidates[0];
 		// Must occur exactly once as a string too.
 		if (source.indexOf(span) !== source.lastIndexOf(span)) {
-			throw new Error(`oldText matched a ${via} span that occurs more than once in ${where}; provide more context to disambiguate`);
+			throw new EditError(`oldText matched a ${via} span that occurs more than once in ${where}; provide more context to disambiguate`, "ambiguous");
 		}
 		if (isDisproportionate(span, effectiveFind)) {
-			throw new Error(`refusing ${via} match in ${where}: the matched span is much larger than oldText; re-read and pass exact text`);
+			throw new EditError(`refusing ${via} match in ${where}: the matched span is much larger than oldText; re-read and pass exact text`, "disproportionate");
 		}
 		const start = source.indexOf(span);
 		let end = start + span.length;
@@ -180,7 +244,7 @@ function resolveSpan(source: string, oldText: string, where: string): { start: n
 		return { start, end, via };
 	}
 
-	throw new Error(`oldText not found in ${where}; it must match the file's text including whitespace and indentation`);
+	throw new EditError(`oldText not found in ${where}; it must match the file's text including whitespace and indentation`, "not-found");
 }
 
 // --- fuzzy strategies: each returns ORIGINAL substrings (never normalized) ---
