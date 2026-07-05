@@ -5,6 +5,9 @@
   "license": "MIT",
   "type": "module",
   "main": "src/index.ts",
+  "pi": {
+    "extensions": ["src/index.ts"]
+  },
   "scripts": {
     "test": "node --test --import tsx \"test/**/*.test.ts\"",
     "bench": "node --import tsx bench/ab.ts",
